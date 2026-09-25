@@ -274,6 +274,10 @@ impl ChunkStorage for FailingDelete {
     fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
         self.inner.list_chunk_hashes()
     }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
 }
 
 #[test]
@@ -501,6 +505,10 @@ impl ChunkStorage for UnlockOnDelete {
 
     fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
         self.inner.list_chunk_hashes()
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
     }
 }
 
@@ -760,6 +768,10 @@ impl ChunkStorage for InterruptOnce {
 
     fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
         self.inner.list_chunk_hashes()
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
     }
 }
 
@@ -1399,6 +1411,10 @@ impl ChunkStorage for ListFirst {
         );
         Ok(hashes)
     }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
 }
 
 #[test]
@@ -1657,6 +1673,10 @@ impl ChunkStorage for SlowRead {
 
     fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
         self.0.list_chunk_hashes()
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.0.sync()
     }
 }
 

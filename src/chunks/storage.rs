@@ -46,10 +46,9 @@ pub trait ChunkStorage: Send + Sync {
     }
 
     /// Makes every chunk written so far durable. Backups call it before saving the index that
-    /// counts them, so `write_chunk_content` need not sync each chunk.
-    fn sync(&self) -> std::io::Result<()> {
-        Ok(())
-    }
+    /// counts them, so `write_chunk_content` need not sync each chunk. Required so a wrapper
+    /// around another storage can't silently drop the inner one's sync.
+    fn sync(&self) -> std::io::Result<()>;
 }
 
 pub struct ChunkStorageLocal(pub PathBuf);
@@ -96,22 +95,17 @@ impl ChunkStorage for ChunkStorageLocal {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
     fn sync(&self) -> std::io::Result<()> {
-        use std::os::fd::AsRawFd;
-
         // One flush of the whole filesystem instead of one per chunk.
-        let dir = File::open(&self.0)?;
-        match unsafe { libc::syncfs(dir.as_raw_fd()) } {
-            0 => Ok(()),
-            _ => Err(std::io::Error::last_os_error()),
+        #[cfg(target_os = "linux")]
+        if unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(&File::open(&self.0)?)) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
-    }
-
-    #[cfg(target_vendor = "apple")]
-    fn sync(&self) -> std::io::Result<()> {
         // F_FULLFSYNC flushes the drive's cache, which holds every chunk `flush` handed it.
-        File::open(&self.0)?.sync_all()
+        #[cfg(target_vendor = "apple")]
+        File::open(&self.0)?.sync_all()?;
+        // Elsewhere `flush` already synced each chunk.
+        Ok(())
     }
 
     fn has_chunk(&self, chunk: &ChunkHash) -> std::io::Result<bool> {
