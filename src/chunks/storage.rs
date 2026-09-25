@@ -44,6 +44,12 @@ pub trait ChunkStorage: Send + Sync {
     fn remove_leftovers(&self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Makes every chunk written so far durable. Backups call it before saving the index that
+    /// counts them, so `write_chunk_content` need not sync each chunk.
+    fn sync(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub struct ChunkStorageLocal(pub PathBuf);
@@ -61,11 +67,9 @@ impl ChunkStorage for ChunkStorageLocal {
     fn write_chunk_content(&self, chunk: &ChunkHash, content: &[u8]) -> std::io::Result<()> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+        // Replaces an existing file: one the index doesn't count may be torn by a crash before
+        // `sync`.
         let path = self.0.join(self.path_from_chunk(chunk));
-        if is_chunk_file(&path) {
-            return Ok(());
-        }
-
         let parent = path.parent().unwrap();
         std::fs::create_dir_all(parent)?;
 
@@ -80,7 +84,7 @@ impl ChunkStorage for ChunkStorageLocal {
             file => file?,
         };
 
-        if let Err(err) = file.write_all(content).and_then(|()| file.sync_all()) {
+        if let Err(err) = file.write_all(content).and_then(|()| flush(&file)) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
         }
@@ -90,6 +94,24 @@ impl ChunkStorage for ChunkStorageLocal {
             return Err(err);
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sync(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        // One flush of the whole filesystem instead of one per chunk.
+        let dir = File::open(&self.0)?;
+        match unsafe { libc::syncfs(dir.as_raw_fd()) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn sync(&self) -> std::io::Result<()> {
+        // F_FULLFSYNC flushes the drive's cache, which holds every chunk `flush` handed it.
+        File::open(&self.0)?.sync_all()
     }
 
     fn has_chunk(&self, chunk: &ChunkHash) -> std::io::Result<bool> {
@@ -189,6 +211,20 @@ fn parse_chunk_name(name: &str) -> Option<ChunkHash> {
     }
 
     Some(hash)
+}
+
+/// Starts making a written chunk durable; `sync` finishes. Apple's plain `fsync` hands the data to
+/// the drive without flushing its cache (`sync_all` would, per chunk). Linux leaves it to `syncfs`.
+fn flush(file: &File) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    if unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(file)) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    file.sync_all()?;
+    #[cfg(target_os = "linux")]
+    let _ = file;
+    Ok(())
 }
 
 /// A regular file with at least the format byte. Empty ones, left by a crash, get rewritten.

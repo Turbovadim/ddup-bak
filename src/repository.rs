@@ -548,6 +548,8 @@ impl Repository {
                 threads,
             )
             .and_then(|mut archive| {
+                // Before the index counts the new chunks, so a crash can't leave it trusting one.
+                self.storage.sync()?;
                 index.save(&self.index_path())?;
                 archive.write_end_header()?;
                 handle.sync_all()?;
@@ -640,9 +642,9 @@ impl Repository {
                 if metadata.is_file() {
                     job.files.acquire();
                     let (job, path, relative) = (&job, path.to_path_buf(), relative.to_path_buf());
-                    scope.spawn(move |scope| {
+                    scope.spawn(move |_| {
                         record(
-                            job.write_file(scope, &path, &relative, name, parent),
+                            job.write_file(&path, &relative, name, parent),
                             &job.error,
                         );
                         job.files.release();
@@ -1380,9 +1382,8 @@ impl Job<'_> {
         self.children.lock().entry(parent).or_default().push(entry);
     }
 
-    fn write_file<'scope>(
-        &'scope self,
-        scope: &rayon::Scope<'scope>,
+    fn write_file(
+        &self,
         path: &Path,
         relative: &Path,
         name: String,
@@ -1400,7 +1401,7 @@ impl Job<'_> {
                 path.display()
             )));
         }
-        let (hashes, size) = self.chunk_file(scope, file, &metadata, relative)?;
+        let (hashes, size) = self.chunk_file(file, &metadata, relative)?;
 
         let entry = self.archive.lock().write_file_entry(
             hashes.as_flattened(),
@@ -1415,9 +1416,8 @@ impl Job<'_> {
         Ok(())
     }
 
-    fn chunk_file<'scope>(
-        &'scope self,
-        scope: &rayon::Scope<'scope>,
+    fn chunk_file(
+        &self,
         file: File,
         metadata: &Metadata,
         relative: &Path,
@@ -1430,7 +1430,7 @@ impl Job<'_> {
             });
         let (min, avg, max) =
             chunks::cdc_parameters(self.chunk_size, self.max_chunk_count, metadata.len());
-        let mut hashes = Vec::new();
+        let hashes = Mutex::new(Vec::new());
         let mut size = 0u64;
 
         let mut data = Vec::new();
@@ -1439,48 +1439,63 @@ impl Job<'_> {
             (&file).read_to_end(&mut data)?;
         }
         if metadata.len() <= max as u64 && data.len() <= max {
-            for chunk in fastcdc::v2020::FastCDC::new(&data, min, avg, max) {
-                let chunk = &data[chunk.offset..chunk.offset + chunk.length];
-                size += chunk.len() as u64;
-                hashes.push(self.store(scope, Cow::Borrowed(chunk), compression)?);
-            }
+            rayon::scope(|scope| {
+                for chunk in fastcdc::v2020::FastCDC::new(&data, min, avg, max) {
+                    let chunk = &data[chunk.offset..chunk.offset + chunk.length];
+                    size += chunk.len() as u64;
+                    self.store(scope, Cow::Borrowed(chunk), compression, &hashes)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })?;
         } else {
             // `data` holds what was read before the file turned out larger than expected.
             let reader = Cursor::new(data).chain(file);
-            for chunk in fastcdc::v2020::StreamCDC::new(reader, min, avg, max) {
-                let data = chunk.map_err(cdc_error)?.data;
-                size += data.len() as u64;
-                hashes.push(self.store(scope, Cow::Owned(data), compression)?);
-            }
+            rayon::scope(|scope| {
+                for chunk in fastcdc::v2020::StreamCDC::new(reader, min, avg, max) {
+                    let data = chunk.map_err(cdc_error)?.data;
+                    size += data.len() as u64;
+                    self.store(scope, Cow::Owned(data), compression, &hashes)?;
+                }
+                Ok::<(), std::io::Error>(())
+            })?;
         }
 
-        Ok((hashes, size))
+        Ok((hashes.into_inner(), size))
     }
 
-    /// Hashes a chunk and stores it unless the index already has it.
-    fn store<'scope>(
-        &'scope self,
-        scope: &rayon::Scope<'scope>,
-        data: Cow<'_, [u8]>,
+    /// Hashes a chunk into the next slot of `hashes` and stores it unless the index already has
+    /// it. Runs on `scope` when a slot is free, so a file's chunks hash in parallel.
+    fn store<'s>(
+        &'s self,
+        scope: &rayon::Scope<'s>,
+        data: Cow<'s, [u8]>,
         compression: CompressionFormat,
-    ) -> std::io::Result<ChunkHash> {
-        let hash = self.index.hash_algorithm.hash(&data);
-        // A count doesn't prove the chunk exists; a lost one is rewritten here.
-        if self.index.reference(&hash) > 1 && self.storage.has_chunk(&hash)? {
-            return Ok(hash);
-        }
+        hashes: &'s Mutex<Vec<ChunkHash>>,
+    ) -> std::io::Result<()> {
+        let slot = {
+            let mut hashes = hashes.lock();
+            hashes.push(ChunkHash::default());
+            hashes.len() - 1
+        };
+        let store = move || {
+            let hash = self.index.hash_algorithm.hash(&data);
+            hashes.lock()[slot] = hash;
+            // A count doesn't prove the chunk exists; a lost one is rewritten here.
+            if self.index.reference(&hash) > 1 && self.storage.has_chunk(&hash)? {
+                return Ok(());
+            }
+            chunks::write_chunk(&**self.storage, &hash, &data, compression)
+        };
 
         if self.chunks.try_acquire() {
-            let data = data.into_owned();
             scope.spawn(move |_| {
-                let result = chunks::write_chunk(&**self.storage, &hash, &data, compression);
-                record(result, &self.error);
+                record(store(), &self.error);
                 self.chunks.release();
             });
+            Ok(())
         } else {
-            chunks::write_chunk(&**self.storage, &hash, &data, compression)?;
+            store()
         }
-        Ok(hash)
     }
 }
 

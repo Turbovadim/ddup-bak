@@ -11,6 +11,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     fs::File,
+    hash::{BuildHasherDefault, Hasher},
     io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     path::Path,
 };
@@ -99,7 +100,25 @@ pub struct ChunkIndex {
     pub chunk_size: usize,
     pub max_chunk_count: usize,
     pub hash_algorithm: HashAlgorithm,
-    chunks: DashMap<ChunkHash, u64>,
+    chunks: DashMap<ChunkHash, u64, BuildHasherDefault<PrefixHasher>>,
+}
+
+/// Chunk hashes are already uniform, so the index keys its map by their leading bytes instead of
+/// hashing them again.
+#[derive(Default)]
+struct PrefixHasher(u64);
+
+impl Hasher for PrefixHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut word = [0; 8];
+        let len = bytes.len().min(8);
+        word[..len].copy_from_slice(&bytes[..len]);
+        self.0 = self.0.rotate_left(8) ^ u64::from_le_bytes(word);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl ChunkIndex {
@@ -108,7 +127,7 @@ impl ChunkIndex {
             chunk_size,
             max_chunk_count,
             hash_algorithm,
-            chunks: DashMap::new(),
+            chunks: DashMap::default(),
         }
     }
 
@@ -121,31 +140,52 @@ impl ChunkIndex {
                 "index uses format 1; the repository has not been migrated",
             ));
         }
-        // Format 4 ends in a checksum, so read the whole file here; `open` streams to keep header
-        // reads cheap.
-        if header.version == 4 {
-            let mut bytes = std::fs::read(path)?;
-            let Some(body) = bytes.len().checked_sub(32) else {
-                return Err(invalid("index is cut short"));
-            };
-            if blake3::hash(&bytes[..body]).as_bytes() != &bytes[body..] {
-                return Err(invalid("index does not match its checksum"));
+        if header.version != 4 {
+            let index = Self::with_capacity(header, count.min(1 << 20) as usize);
+            index.read_records(&mut reader, count)?;
+            if reader.read(&mut [0])? != 0 {
+                return Err(invalid("index has trailing data"));
             }
-            bytes.truncate(body);
-            let mut cursor = Cursor::new(bytes);
-            cursor.set_position(25);
-            reader = Box::new(cursor);
+            return Ok(index);
         }
 
-        let index = Self::new(
-            header.chunk_size,
-            header.max_chunk_count,
-            header.hash_algorithm,
-        );
+        // Format 4 ends in a checksum, so read the whole file here; `open` streams to keep header
+        // reads cheap.
+        let bytes = std::fs::read(path)?;
+        let Some(body) = bytes.len().checked_sub(32) else {
+            return Err(invalid("index is cut short"));
+        };
+        if blake3::hash(&bytes[..body]).as_bytes() != &bytes[body..] {
+            return Err(invalid("index does not match its checksum"));
+        }
+        let mut records = bytes.get(25..body).unwrap_or_default();
+        // A record is at least 33 bytes, which caps what a damaged count can allocate.
+        let index = Self::with_capacity(header, count.min(records.len() as u64 / 33) as usize);
+        index.read_records(&mut records, count)?;
+        if !records.is_empty() {
+            return Err(invalid("index has trailing data"));
+        }
+        Ok(index)
+    }
+
+    fn with_capacity(header: IndexHeader, capacity: usize) -> Self {
+        Self {
+            chunks: DashMap::with_capacity_and_hasher(capacity, Default::default()),
+            ..Self::new(
+                header.chunk_size,
+                header.max_chunk_count,
+                header.hash_algorithm,
+            )
+        }
+    }
+
+    /// Reads `count` (hash, references) records. Generic so the in-memory format 4 path inlines
+    /// the varint reads.
+    fn read_records(&self, reader: &mut impl Read, count: u64) -> std::io::Result<()> {
         let mut hash = [0; 32];
         for _ in 0..count {
             reader.read_exact(&mut hash)?;
-            let references = varint::decode(&mut reader)?;
+            let references = varint::decode(reader)?;
             // Rejected so incrementing can't overflow.
             if references > MAX_REFERENCES {
                 return Err(invalid(format!(
@@ -153,13 +193,9 @@ impl ChunkIndex {
                     hex(&hash)
                 )));
             }
-            index.chunks.insert(hash, references);
+            self.chunks.insert(hash, references);
         }
-        if reader.read(&mut [0])? != 0 {
-            return Err(invalid("index has trailing data"));
-        }
-
-        Ok(index)
+        Ok(())
     }
 
     /// Loads a format 1 index and the chunk id map its archives reference.
