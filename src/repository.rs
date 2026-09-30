@@ -19,7 +19,10 @@ use std::{
     fs::{File, FileTimes, Metadata},
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -548,8 +551,6 @@ impl Repository {
                 threads,
             )
             .and_then(|mut archive| {
-                // Before the index counts the new chunks, so a crash can't leave it trusting one.
-                self.storage.sync()?;
                 index.save(&self.index_path())?;
                 archive.write_end_header()?;
                 handle.sync_all()?;
@@ -589,6 +590,7 @@ impl Repository {
             max_chunk_count: self.max_chunk_count,
             files: Inflight::new(pool.current_num_threads() * 4),
             chunks: Inflight::new(pool.current_num_threads() * 2),
+            wrote: AtomicBool::new(false),
             error: Mutex::new(None),
             children: Mutex::new(HashMap::new()),
         };
@@ -643,10 +645,7 @@ impl Repository {
                     job.files.acquire();
                     let (job, path, relative) = (&job, path.to_path_buf(), relative.to_path_buf());
                     scope.spawn(move |_| {
-                        record(
-                            job.write_file(&path, &relative, name, parent),
-                            &job.error,
-                        );
+                        record(job.write_file(&path, &relative, name, parent), &job.error);
                         job.files.release();
                     });
                     continue;
@@ -686,6 +685,11 @@ impl Repository {
 
         if let Some(err) = job.error.into_inner() {
             return Err(err);
+        }
+        // Before the caller saves the index that counts the new chunks, so a crash can't leave it
+        // trusting one. Chunks a backup only reused were synced by the backup that wrote them.
+        if job.wrote.into_inner() {
+            self.storage.sync()?;
         }
 
         let mut archive = job.archive.into_inner();
@@ -1370,6 +1374,7 @@ struct Job<'a> {
     max_chunk_count: usize,
     files: Inflight,
     chunks: Inflight,
+    wrote: AtomicBool,
     error: Mutex<Option<std::io::Error>>,
     children: Mutex<HashMap<PathBuf, Vec<Entry>>>,
 }
@@ -1484,6 +1489,7 @@ impl Job<'_> {
             if self.index.reference(&hash) > 1 && self.storage.has_chunk(&hash)? {
                 return Ok(());
             }
+            self.wrote.store(true, Ordering::Relaxed);
             chunks::write_chunk(&**self.storage, &hash, &data, compression)
         };
 

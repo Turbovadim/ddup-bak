@@ -37,6 +37,10 @@ const CHUNK_HEADER_LEN: u64 = 1;
 const INDEX_MAGIC_V4: &[u8; 8] = b"DDUPIDX4";
 const INDEX_MAGIC_V3: &[u8; 8] = b"DDUPIDX3";
 const INDEX_MAGIC_V2: &[u8; 8] = b"DDUPIDX2";
+/// Magic plus the 17 bytes `parse_header` reads, in formats 3 and 4.
+const INDEX_HEADER_LEN: usize = 25;
+/// Smallest index record: a hash and a one-byte reference count.
+const INDEX_RECORD_MIN_LEN: usize = 33;
 
 /// Hash that names chunk files, fixed per chunk store and recorded in the index header.
 /// BLAKE2b is the default for compatibility; BLAKE3 is faster and opt-in.
@@ -104,7 +108,8 @@ pub struct ChunkIndex {
 }
 
 /// Chunk hashes are already uniform, so the index keys its map by their leading bytes instead of
-/// hashing them again.
+/// hashing them again. `[u8; 32]` hashes as a length prefix followed by the bytes, two `write`
+/// calls, so each call is mixed into the last rather than replacing it.
 #[derive(Default)]
 struct PrefixHasher(u64);
 
@@ -141,12 +146,7 @@ impl ChunkIndex {
             ));
         }
         if header.version != 4 {
-            let index = Self::with_capacity(header, count.min(1 << 20) as usize);
-            index.read_records(&mut reader, count)?;
-            if reader.read(&mut [0])? != 0 {
-                return Err(invalid("index has trailing data"));
-            }
-            return Ok(index);
+            return Self::read_records(header, &mut reader, count, 1 << 20);
         }
 
         // Format 4 ends in a checksum, so read the whole file here; `open` streams to keep header
@@ -158,30 +158,29 @@ impl ChunkIndex {
         if blake3::hash(&bytes[..body]).as_bytes() != &bytes[body..] {
             return Err(invalid("index does not match its checksum"));
         }
-        let mut records = bytes.get(25..body).unwrap_or_default();
-        // A record is at least 33 bytes, which caps what a damaged count can allocate.
-        let index = Self::with_capacity(header, count.min(records.len() as u64 / 33) as usize);
-        index.read_records(&mut records, count)?;
-        if !records.is_empty() {
-            return Err(invalid("index has trailing data"));
-        }
-        Ok(index)
+        let mut records = bytes.get(INDEX_HEADER_LEN..body).unwrap_or_default();
+        let capacity = records.len() / INDEX_RECORD_MIN_LEN;
+        Self::read_records(header, &mut records, count, capacity)
     }
 
-    fn with_capacity(header: IndexHeader, capacity: usize) -> Self {
-        Self {
-            chunks: DashMap::with_capacity_and_hasher(capacity, Default::default()),
-            ..Self::new(
-                header.chunk_size,
-                header.max_chunk_count,
-                header.hash_algorithm,
-            )
-        }
-    }
-
-    /// Reads `count` (hash, references) records. Generic so the in-memory format 4 path inlines
-    /// the varint reads.
-    fn read_records(&self, reader: &mut impl Read, count: u64) -> std::io::Result<()> {
+    /// Reads an index of `count` (hash, references) records that must end the reader. `capacity`
+    /// caps what a damaged count can allocate. Generic so the in-memory format 4 path inlines the
+    /// varint reads.
+    fn read_records(
+        header: IndexHeader,
+        reader: &mut impl Read,
+        count: u64,
+        capacity: usize,
+    ) -> std::io::Result<Self> {
+        let index = Self {
+            chunk_size: header.chunk_size,
+            max_chunk_count: header.max_chunk_count,
+            hash_algorithm: header.hash_algorithm,
+            chunks: DashMap::with_capacity_and_hasher(
+                count.min(capacity as u64) as usize,
+                Default::default(),
+            ),
+        };
         let mut hash = [0; 32];
         for _ in 0..count {
             reader.read_exact(&mut hash)?;
@@ -193,9 +192,12 @@ impl ChunkIndex {
                     hex(&hash)
                 )));
             }
-            self.chunks.insert(hash, references);
+            index.chunks.insert(hash, references);
         }
-        Ok(())
+        if reader.read(&mut [0])? != 0 {
+            return Err(invalid("index has trailing data"));
+        }
+        Ok(index)
     }
 
     /// Loads a format 1 index and the chunk id map its archives reference.

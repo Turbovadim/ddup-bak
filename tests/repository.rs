@@ -1862,6 +1862,52 @@ fn truncated_index_is_rejected() {
     assert!(fixture.backup("c", &source).is_err());
 }
 
+struct FailingSync(ChunkStorageLocal);
+
+impl ChunkStorage for FailingSync {
+    fn read_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+    ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
+        self.0.read_chunk_content(chunk)
+    }
+
+    fn write_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.0.write_chunk_content(chunk, content)
+    }
+
+    fn delete_chunk_content(&self, chunk: &ddup_bak::chunks::ChunkHash) -> std::io::Result<()> {
+        self.0.delete_chunk_content(chunk)
+    }
+
+    fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
+        self.0.list_chunk_hashes()
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        Err(std::io::Error::other("disk gave up"))
+    }
+}
+
+#[test]
+fn a_backup_whose_chunks_cannot_be_synced_is_not_recorded() {
+    let fixture =
+        Fixture::with_storage(|chunks| Some(Arc::new(FailingSync(ChunkStorageLocal(chunks)))));
+    let source = fixture.source("src", &[("f", &random(20_000))]);
+
+    assert!(fixture.backup("a", &source).is_err());
+    assert!(fixture.repository.list_archives().unwrap().is_empty());
+    assert!(
+        ChunkIndex::load(&fixture.chunks_dir().join("index"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn failed_backup_leaves_nothing_behind() {

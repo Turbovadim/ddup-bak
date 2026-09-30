@@ -83,7 +83,7 @@ impl ChunkStorage for ChunkStorageLocal {
             file => file?,
         };
 
-        if let Err(err) = file.write_all(content).and_then(|()| flush(&file)) {
+        if let Err(err) = file.write_all(content).and_then(|()| durable::chunk(&file)) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
         }
@@ -96,16 +96,7 @@ impl ChunkStorage for ChunkStorageLocal {
     }
 
     fn sync(&self) -> std::io::Result<()> {
-        // One flush of the whole filesystem instead of one per chunk.
-        #[cfg(target_os = "linux")]
-        if unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(&File::open(&self.0)?)) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // F_FULLFSYNC flushes the drive's cache, which holds every chunk `flush` handed it.
-        #[cfg(target_vendor = "apple")]
-        File::open(&self.0)?.sync_all()?;
-        // Elsewhere `flush` already synced each chunk.
-        Ok(())
+        durable::all(&self.0)
     }
 
     fn has_chunk(&self, chunk: &ChunkHash) -> std::io::Result<bool> {
@@ -207,18 +198,68 @@ fn parse_chunk_name(name: &str) -> Option<ChunkHash> {
     Some(hash)
 }
 
-/// Starts making a written chunk durable; `sync` finishes. Apple's plain `fsync` hands the data to
-/// the drive without flushing its cache (`sync_all` would, per chunk). Linux leaves it to `syncfs`.
-fn flush(file: &File) -> std::io::Result<()> {
-    #[cfg(target_vendor = "apple")]
-    if unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(file)) } != 0 {
-        return Err(std::io::Error::last_os_error());
+/// Chunk durability in two steps: `chunk` after each chunk is written, `all` once per backup.
+#[cfg(target_os = "linux")]
+mod durable {
+    use std::{fs::File, os::fd::AsRawFd, path::Path, sync::LazyLock};
+
+    /// `syncfs` reports failed writes since Linux 5.8. Older kernels sync each chunk instead, as
+    /// does a kernel whose version can't be read.
+    static SYNCFS_REPORTS_ERRORS: LazyLock<bool> = LazyLock::new(|| {
+        std::fs::read_to_string("/proc/sys/kernel/osrelease").is_ok_and(|release| {
+            let mut parts = release
+                .split(|c: char| !c.is_ascii_digit())
+                .map(|part| part.parse::<u32>().unwrap_or(0));
+            (parts.next(), parts.next()) >= (Some(5), Some(8))
+        })
+    });
+
+    pub fn chunk(file: &File) -> std::io::Result<()> {
+        if *SYNCFS_REPORTS_ERRORS {
+            return Ok(());
+        }
+        file.sync_all()
     }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    file.sync_all()?;
-    #[cfg(target_os = "linux")]
-    let _ = file;
-    Ok(())
+
+    /// One flush of the whole filesystem instead of one per chunk.
+    pub fn all(dir: &Path) -> std::io::Result<()> {
+        if *SYNCFS_REPORTS_ERRORS && unsafe { libc::syncfs(File::open(dir)?.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+mod durable {
+    use std::{fs::File, os::fd::AsRawFd, path::Path};
+
+    /// Plain `fsync` hands the data to the drive without flushing its cache, which `sync_all`
+    /// would do per chunk.
+    pub fn chunk(file: &File) -> std::io::Result<()> {
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// F_FULLFSYNC flushes the drive's cache, which holds every chunk `chunk` handed it.
+    pub fn all(dir: &Path) -> std::io::Result<()> {
+        File::open(dir)?.sync_all()
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+mod durable {
+    use std::{fs::File, path::Path};
+
+    pub fn chunk(file: &File) -> std::io::Result<()> {
+        file.sync_all()
+    }
+
+    pub fn all(_dir: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A regular file with at least the format byte. Empty ones, left by a crash, get rewritten.
