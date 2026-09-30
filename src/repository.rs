@@ -11,6 +11,7 @@ use crate::{
     },
     lock::Lock,
 };
+use dashmap::DashSet;
 use parking_lot::{Condvar, Mutex};
 use rayon::prelude::*;
 use std::{
@@ -19,10 +20,7 @@ use std::{
     fs::{File, FileTimes, Metadata},
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -394,7 +392,7 @@ impl Repository {
         Self {
             directory: directory.to_path_buf(),
             storage: storage
-                .unwrap_or_else(|| Arc::new(ChunkStorageLocal(chunks_directory.clone()))),
+                .unwrap_or_else(|| Arc::new(ChunkStorageLocal::new(chunks_directory.clone()))),
             chunks_directory,
             chunk_size,
             max_chunk_count,
@@ -551,6 +549,9 @@ impl Repository {
                 threads,
             )
             .and_then(|mut archive| {
+                // Before the index counts the new chunks, so a crash can't leave it trusting one.
+                // Even if this backup wrote none: a failed one may have left some unsynced.
+                self.storage.sync()?;
                 index.save(&self.index_path())?;
                 archive.write_end_header()?;
                 handle.sync_all()?;
@@ -590,7 +591,7 @@ impl Repository {
             max_chunk_count: self.max_chunk_count,
             files: Inflight::new(pool.current_num_threads() * 4),
             chunks: Inflight::new(pool.current_num_threads() * 2),
-            wrote: AtomicBool::new(false),
+            new: DashSet::new(),
             error: Mutex::new(None),
             children: Mutex::new(HashMap::new()),
         };
@@ -685,11 +686,6 @@ impl Repository {
 
         if let Some(err) = job.error.into_inner() {
             return Err(err);
-        }
-        // Before the caller saves the index that counts the new chunks, so a crash can't leave it
-        // trusting one. Chunks a backup only reused were synced by the backup that wrote them.
-        if job.wrote.into_inner() {
-            self.storage.sync()?;
         }
 
         let mut archive = job.archive.into_inner();
@@ -1374,7 +1370,8 @@ struct Job<'a> {
     max_chunk_count: usize,
     files: Inflight,
     chunks: Inflight,
-    wrote: AtomicBool,
+    /// Chunks this backup added to the index.
+    new: DashSet<ChunkHash>,
     error: Mutex<Option<std::io::Error>>,
     children: Mutex<HashMap<PathBuf, Vec<Entry>>>,
 }
@@ -1485,12 +1482,20 @@ impl Job<'_> {
         let store = move || {
             let hash = self.index.hash_algorithm.hash(&data);
             hashes.lock()[slot] = hash;
+            let new = self.index.reference(&hash) == 1;
+            if new {
+                self.new.insert(hash);
             // A count doesn't prove the chunk exists; a lost one is rewritten here.
-            if self.index.reference(&hash) > 1 && self.storage.has_chunk(&hash)? {
+            } else if self.storage.has_chunk(&hash)? {
                 return Ok(());
             }
-            self.wrote.store(true, Ordering::Relaxed);
-            chunks::write_chunk(&**self.storage, &hash, &data, compression)
+            chunks::write_chunk(&**self.storage, &hash, &data, compression)?;
+            // The saved index already trusts a rewritten lost chunk, so it is synced at once: the
+            // backup may fail or crash before its own sync and leave it torn.
+            if !new && !self.new.contains(&hash) {
+                self.storage.sync()?;
+            }
+            Ok(())
         };
 
         if self.chunks.try_acquire() {

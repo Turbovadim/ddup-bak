@@ -82,13 +82,13 @@ impl Fixture {
     }
 
     fn chunk_path(&self, content: &[u8]) -> PathBuf {
-        let storage = ChunkStorageLocal(self.chunks_dir());
+        let storage = ChunkStorageLocal::new(self.chunks_dir());
         self.chunks_dir()
             .join(storage.path_from_chunk(&HashAlgorithm::default().hash(content)))
     }
 
     fn stored_chunks(&self) -> usize {
-        ChunkStorageLocal(self.chunks_dir())
+        ChunkStorageLocal::new(self.chunks_dir())
             .list_chunk_hashes()
             .unwrap()
             .len()
@@ -284,7 +284,7 @@ impl ChunkStorage for FailingDelete {
 fn interrupted_delete_does_not_leave_the_index_pointing_at_missing_chunks() {
     let fixture = Fixture::with_storage(|chunks| {
         Some(Arc::new(FailingDelete {
-            inner: ChunkStorageLocal(chunks),
+            inner: ChunkStorageLocal::new(chunks),
             deletes: AtomicUsize::new(0),
             fail_at: 2,
         }))
@@ -335,7 +335,7 @@ fn a_crash_between_chunk_deletion_and_the_index_save_is_recovered() {
     let shared = random(50_000);
     let a = fixture.source("a", &[("shared", &shared), ("only-a", &seeded(1, 50_000))]);
     let b = fixture.source("b", &[("shared", &shared), ("only-b", &seeded(2, 50_000))]);
-    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let storage = ChunkStorageLocal::new(fixture.chunks_dir());
     fixture.backup("b", &b).unwrap();
     let of_b = storage.list_chunk_hashes().unwrap();
     fixture.backup("a", &a).unwrap();
@@ -464,7 +464,7 @@ fn chunks_an_interrupted_clean_deleted_are_written_again() {
     // An interrupted clean: counts at zero, files already gone.
     let index_path = fixture.chunks_dir().join("index");
     let index = ChunkIndex::load(&index_path).unwrap();
-    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let storage = ChunkStorageLocal::new(fixture.chunks_dir());
     for (hash, _) in index.iter().collect::<Vec<_>>() {
         index.set(&hash, 0);
         storage.delete_chunk_content(&hash).unwrap();
@@ -516,7 +516,7 @@ impl ChunkStorage for UnlockOnDelete {
 fn a_delete_sharing_a_pending_name_frees_space_before_it_needs_any() {
     let fixture = Fixture::with_storage(|chunks| {
         Some(Arc::new(UnlockOnDelete {
-            inner: ChunkStorageLocal(chunks.clone()),
+            inner: ChunkStorageLocal::new(chunks.clone()),
             blocker: chunks.join("index.tmp"),
         }))
     });
@@ -595,7 +595,7 @@ fn a_chunk_lost_from_storage_is_written_back_by_the_next_backup_after_rebuild() 
     let fixture = Fixture::new();
     let source = fixture.source("src", &[("f", &random(30_000))]);
     fixture.backup("a", &source).unwrap();
-    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let storage = ChunkStorageLocal::new(fixture.chunks_dir());
     let lost = storage.list_chunk_hashes().unwrap()[0];
     storage.delete_chunk_content(&lost).unwrap();
 
@@ -620,7 +620,7 @@ fn a_chunk_lost_from_storage_is_written_back_by_the_next_backup_after_recovery()
         ddup_bak.join("deleting/a.ddup"),
     )
     .unwrap();
-    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let storage = ChunkStorageLocal::new(fixture.chunks_dir());
     let lost = storage.list_chunk_hashes().unwrap()[0];
     storage.delete_chunk_content(&lost).unwrap();
 
@@ -671,7 +671,7 @@ fn a_directory_where_a_chunk_should_be_fails_the_backup() {
     let fixture = Fixture::new();
     let source = fixture.source("src", &[("f", &random(30_000))]);
     fixture.backup("a", &source).unwrap();
-    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let storage = ChunkStorageLocal::new(fixture.chunks_dir());
     let hash = storage.list_chunk_hashes().unwrap()[0];
     let path = fixture.chunks_dir().join(storage.path_from_chunk(&hash));
     fs::remove_file(&path).unwrap();
@@ -702,7 +702,7 @@ fn rebuild_keeps_the_recorded_hash_algorithm_when_storage_is_empty() {
             4,
         )
         .unwrap();
-    let storage = ChunkStorageLocal(repo.join(".ddup-bak/chunks"));
+    let storage = ChunkStorageLocal::new(repo.join(".ddup-bak/chunks"));
     for hash in storage.list_chunk_hashes().unwrap() {
         storage.delete_chunk_content(&hash).unwrap();
     }
@@ -779,7 +779,7 @@ impl ChunkStorage for InterruptOnce {
 fn an_interrupted_chunk_read_is_retried_not_skipped() {
     let fixture = Fixture::with_storage(|chunks| {
         Some(Arc::new(InterruptOnce {
-            inner: ChunkStorageLocal(chunks),
+            inner: ChunkStorageLocal::new(chunks),
             done: std::sync::atomic::AtomicBool::new(false),
         }))
     });
@@ -807,14 +807,14 @@ fn an_interrupted_chunk_read_is_retried_not_skipped() {
 fn a_storage_with_the_default_existence_check_rejects_a_directory_in_a_chunks_place() {
     let fixture = Fixture::with_storage(|chunks| {
         Some(Arc::new(FailingDelete {
-            inner: ChunkStorageLocal(chunks),
+            inner: ChunkStorageLocal::new(chunks),
             deletes: AtomicUsize::new(0),
             fail_at: usize::MAX,
         }))
     });
     let source = fixture.source("src", &[("f", &random(30_000))]);
     fixture.backup("a", &source).unwrap();
-    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let storage = ChunkStorageLocal::new(fixture.chunks_dir());
     let hash = storage.list_chunk_hashes().unwrap()[0];
     let path = fixture.chunks_dir().join(storage.path_from_chunk(&hash));
     fs::remove_file(&path).unwrap();
@@ -915,7 +915,7 @@ fn an_empty_chunk_file_is_written_over_by_the_next_backup() {
     let fixture = Fixture::new();
     let source = fixture.source("src", &[("f", &random(30_000))]);
     fixture.backup("a", &source).unwrap();
-    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let storage = ChunkStorageLocal::new(fixture.chunks_dir());
     let hash = storage.list_chunk_hashes().unwrap()[0];
     fs::write(
         fixture.chunks_dir().join(storage.path_from_chunk(&hash)),
@@ -963,14 +963,14 @@ fn a_nameless_marker_neither_stops_the_next_backup_nor_survives_clean() {
 fn a_storage_with_the_default_existence_check_writes_over_an_empty_chunk() {
     let fixture = Fixture::with_storage(|chunks| {
         Some(Arc::new(FailingDelete {
-            inner: ChunkStorageLocal(chunks),
+            inner: ChunkStorageLocal::new(chunks),
             deletes: AtomicUsize::new(0),
             fail_at: usize::MAX,
         }))
     });
     let source = fixture.source("src", &[("f", &random(30_000))]);
     fixture.backup("a", &source).unwrap();
-    let storage = ChunkStorageLocal(fixture.chunks_dir());
+    let storage = ChunkStorageLocal::new(fixture.chunks_dir());
     let hash = storage.list_chunk_hashes().unwrap()[0];
     fs::write(
         fixture.chunks_dir().join(storage.path_from_chunk(&hash)),
@@ -1427,7 +1427,7 @@ fn rebuild_tells_the_hash_algorithm_from_a_whole_chunk_not_the_first_listed() {
 
     let storage = Arc::new(ListFirst {
         first: [0; 32],
-        inner: ChunkStorageLocal(fixture.chunks_dir()),
+        inner: ChunkStorageLocal::new(fixture.chunks_dir()),
     });
     let rebuilt = Repository::rebuild(&repo, CHUNK_SIZE, 0, None, Some(storage), None).unwrap();
     let restored = rebuilt.restore_archive("a", None, 2).unwrap();
@@ -1450,7 +1450,7 @@ fn rebuild_moves_past_a_truncated_zstd_chunk_when_telling_the_hash_algorithm() {
         .create_archive("a", Some(walker), Some(&source), None, compression, 4)
         .unwrap();
 
-    let local = ChunkStorageLocal(fixture.chunks_dir());
+    let local = ChunkStorageLocal::new(fixture.chunks_dir());
     let first = local.list_chunk_hashes().unwrap()[0];
     let path = fixture.chunks_dir().join(local.path_from_chunk(&first));
     let bytes = fs::read(&path).unwrap();
@@ -1683,7 +1683,7 @@ impl ChunkStorage for SlowRead {
 #[test]
 fn a_read_in_flight_makes_deletion_wait_not_fail() {
     let fixture =
-        Fixture::with_storage(|chunks| Some(Arc::new(SlowRead(ChunkStorageLocal(chunks)))));
+        Fixture::with_storage(|chunks| Some(Arc::new(SlowRead(ChunkStorageLocal::new(chunks)))));
     let content = random(3_000);
     let source = fixture.source("src", &[("f", &content)]);
     fixture.backup("a", &source).unwrap();
@@ -1862,6 +1862,68 @@ fn truncated_index_is_rejected() {
     assert!(fixture.backup("c", &source).is_err());
 }
 
+struct CountingSync {
+    inner: ChunkStorageLocal,
+    syncs: Arc<AtomicUsize>,
+}
+
+impl ChunkStorage for CountingSync {
+    fn read_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+    ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
+        self.inner.read_chunk_content(chunk)
+    }
+
+    fn write_chunk_content(
+        &self,
+        chunk: &ddup_bak::chunks::ChunkHash,
+        content: &[u8],
+    ) -> std::io::Result<()> {
+        self.inner.write_chunk_content(chunk, content)
+    }
+
+    fn delete_chunk_content(&self, chunk: &ddup_bak::chunks::ChunkHash) -> std::io::Result<()> {
+        self.inner.delete_chunk_content(chunk)
+    }
+
+    fn list_chunk_hashes(&self) -> std::io::Result<Vec<ddup_bak::chunks::ChunkHash>> {
+        self.inner.list_chunk_hashes()
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        self.syncs.fetch_add(1, Ordering::SeqCst);
+        self.inner.sync()
+    }
+}
+
+#[test]
+fn a_rewritten_lost_chunk_is_synced_without_waiting_for_the_backup_to_finish() {
+    let syncs = Arc::new(AtomicUsize::new(0));
+    let fixture = Fixture::with_storage(|chunks| {
+        Some(Arc::new(CountingSync {
+            inner: ChunkStorageLocal::new(chunks),
+            syncs: syncs.clone(),
+        }))
+    });
+    // The same chunk many times over: repeats within a backup are not lost chunks.
+    let content = random(3000);
+    let files: Vec<_> = (0..32).map(|n| format!("f{n}")).collect();
+    let files: Vec<_> = files
+        .iter()
+        .map(|name| (name.as_str(), &content[..]))
+        .collect();
+    let source = fixture.source("src", &files);
+
+    fixture.backup("a", &source).unwrap();
+    assert_eq!(syncs.swap(0, Ordering::SeqCst), 1);
+
+    fs::remove_file(fixture.chunk_path(&content)).unwrap();
+    fixture.backup("b", &source).unwrap();
+    assert!(syncs.load(Ordering::SeqCst) > 1);
+    assert_same_files(&source, &fixture.restore("b").unwrap(), &["f0"]);
+}
+
 struct FailingSync(ChunkStorageLocal);
 
 impl ChunkStorage for FailingSync {
@@ -1896,7 +1958,7 @@ impl ChunkStorage for FailingSync {
 #[test]
 fn a_backup_whose_chunks_cannot_be_synced_is_not_recorded() {
     let fixture =
-        Fixture::with_storage(|chunks| Some(Arc::new(FailingSync(ChunkStorageLocal(chunks)))));
+        Fixture::with_storage(|chunks| Some(Arc::new(FailingSync(ChunkStorageLocal::new(chunks)))));
     let source = fixture.source("src", &[("f", &random(20_000))]);
 
     assert!(fixture.backup("a", &source).is_err());
@@ -2146,7 +2208,7 @@ fn write_format_1_repository(repo: &Path, files: &[(&str, &[Vec<u8>], Compressio
         fs::create_dir_all(repo.join(".ddup-bak").join(sub)).unwrap();
     }
     let chunks_dir = repo.join(".ddup-bak/chunks");
-    let storage = ChunkStorageLocal(chunks_dir.clone());
+    let storage = ChunkStorageLocal::new(chunks_dir.clone());
 
     let mut records = Vec::new();
     let mut archive =
@@ -2262,7 +2324,7 @@ fn format_1_repositories_migrate_on_open_and_keep_deduplicating() {
         ],
     );
     let stored = || {
-        ChunkStorageLocal(repo.join(".ddup-bak/chunks"))
+        ChunkStorageLocal::new(repo.join(".ddup-bak/chunks"))
             .list_chunk_hashes()
             .unwrap()
             .len()
@@ -2446,7 +2508,7 @@ fn an_archive_with_a_damaged_body_blocks_deletion_but_neither_migration_nor_its_
     repository.delete_archive("old", None).unwrap();
     repository.clean(None).unwrap();
     assert!(
-        ChunkStorageLocal(repo.join(".ddup-bak/chunks"))
+        ChunkStorageLocal::new(repo.join(".ddup-bak/chunks"))
             .list_chunk_hashes()
             .unwrap()
             .is_empty()
@@ -2518,7 +2580,7 @@ fn rebuild_recovers_what_a_damaged_format_1_index_still_covers() {
     write_format_1_repository(&repo, &files);
     let index = repo.join(".ddup-bak/chunks/index");
     let intact = fs::read(&index).unwrap();
-    let storage = ChunkStorageLocal(repo.join(".ddup-bak/chunks"));
+    let storage = ChunkStorageLocal::new(repo.join(".ddup-bak/chunks"));
     assert_eq!(storage.list_chunk_hashes().unwrap().len(), contents.len());
 
     fs::write(&index, &intact[..intact.len() * 2 / 3]).unwrap();
@@ -2656,7 +2718,7 @@ fn hash_algorithm_is_chosen_at_init() {
         .create_archive("b", Some(walker), Some(&source), None, None, 2)
         .unwrap();
 
-    let storage = ChunkStorageLocal(repo.join(".ddup-bak/chunks"));
+    let storage = ChunkStorageLocal::new(repo.join(".ddup-bak/chunks"));
     assert!(
         repo.join(".ddup-bak/chunks")
             .join(storage.path_from_chunk(&HashAlgorithm::Blake3.hash(&content)))

@@ -3,7 +3,10 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 pub trait ChunkStorage: Send + Sync {
@@ -51,7 +54,20 @@ pub trait ChunkStorage: Send + Sync {
     fn sync(&self) -> std::io::Result<()>;
 }
 
-pub struct ChunkStorageLocal(pub PathBuf);
+pub struct ChunkStorageLocal {
+    path: PathBuf,
+    /// The chunk directory, opened before the first chunk is written and used by `sync`.
+    dir: OnceLock<File>,
+}
+
+impl ChunkStorageLocal {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            dir: OnceLock::new(),
+        }
+    }
+}
 
 impl ChunkStorage for ChunkStorageLocal {
     fn read_chunk_content(
@@ -59,7 +75,7 @@ impl ChunkStorage for ChunkStorageLocal {
         chunk: &ChunkHash,
     ) -> std::io::Result<Box<dyn Read + Send + Sync>> {
         Ok(Box::new(File::open(
-            self.0.join(self.path_from_chunk(chunk)),
+            self.path.join(self.path_from_chunk(chunk)),
         )?))
     }
 
@@ -68,9 +84,10 @@ impl ChunkStorage for ChunkStorageLocal {
 
         // Replaces an existing file: one the index doesn't count may be torn by a crash before
         // `sync`.
-        let path = self.0.join(self.path_from_chunk(chunk));
+        let path = self.path.join(self.path_from_chunk(chunk));
         let parent = path.parent().unwrap();
         std::fs::create_dir_all(parent)?;
+        durable::begin(&self.path, &self.dir)?;
 
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("{}.{unique}.tmp", std::process::id()));
@@ -96,15 +113,15 @@ impl ChunkStorage for ChunkStorageLocal {
     }
 
     fn sync(&self) -> std::io::Result<()> {
-        durable::all(&self.0)
+        durable::all(&self.path, &self.dir)
     }
 
     fn has_chunk(&self, chunk: &ChunkHash) -> std::io::Result<bool> {
-        Ok(is_chunk_file(&self.0.join(self.path_from_chunk(chunk))))
+        Ok(is_chunk_file(&self.path.join(self.path_from_chunk(chunk))))
     }
 
     fn delete_chunk_content(&self, chunk: &ChunkHash) -> std::io::Result<()> {
-        let path = self.0.join(self.path_from_chunk(chunk));
+        let path = self.path.join(self.path_from_chunk(chunk));
         std::fs::remove_file(&path)?;
 
         for parent in path.ancestors().skip(1).take(2) {
@@ -125,7 +142,7 @@ impl ChunkStorage for ChunkStorageLocal {
                     name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())
                 }))
         };
-        for level in std::fs::read_dir(&self.0)? {
+        for level in std::fs::read_dir(&self.path)? {
             let level = level?;
             if !is_shard(&level)? {
                 continue;
@@ -164,7 +181,7 @@ impl ChunkStorage for ChunkStorageLocal {
                 .collect()
         };
 
-        for first in entries(self.0.clone(), true)? {
+        for first in entries(self.path.clone(), true)? {
             for second in entries(first.path(), true)? {
                 for file in entries(second.path(), false)? {
                     let name = format!(
@@ -198,10 +215,16 @@ fn parse_chunk_name(name: &str) -> Option<ChunkHash> {
     Some(hash)
 }
 
-/// Chunk durability in two steps: `chunk` after each chunk is written, `all` once per backup.
+/// Chunk durability in three steps: `begin` before a chunk is written, `chunk` after, and `all`
+/// once per backup.
 #[cfg(target_os = "linux")]
 mod durable {
-    use std::{fs::File, os::fd::AsRawFd, path::Path, sync::LazyLock};
+    use std::{
+        fs::File,
+        os::fd::AsRawFd,
+        path::Path,
+        sync::{LazyLock, OnceLock},
+    };
 
     /// `syncfs` reports failed writes since Linux 5.8. Older kernels sync each chunk instead, as
     /// does a kernel whose version can't be read.
@@ -214,6 +237,15 @@ mod durable {
         })
     });
 
+    /// Opens the descriptor `all` syncs. `syncfs` misses a failed write that another caller saw
+    /// before its descriptor was opened, so this one is opened ahead of the chunk writes.
+    pub fn begin(dir: &Path, handle: &OnceLock<File>) -> std::io::Result<()> {
+        if *SYNCFS_REPORTS_ERRORS && handle.get().is_none() {
+            let _ = handle.set(File::open(dir)?);
+        }
+        Ok(())
+    }
+
     pub fn chunk(file: &File) -> std::io::Result<()> {
         if *SYNCFS_REPORTS_ERRORS {
             return Ok(());
@@ -222,8 +254,11 @@ mod durable {
     }
 
     /// One flush of the whole filesystem instead of one per chunk.
-    pub fn all(dir: &Path) -> std::io::Result<()> {
-        if *SYNCFS_REPORTS_ERRORS && unsafe { libc::syncfs(File::open(dir)?.as_raw_fd()) } != 0 {
+    pub fn all(dir: &Path, handle: &OnceLock<File>) -> std::io::Result<()> {
+        begin(dir, handle)?;
+        if let Some(dir) = handle.get()
+            && unsafe { libc::syncfs(dir.as_raw_fd()) } != 0
+        {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
@@ -232,7 +267,11 @@ mod durable {
 
 #[cfg(target_vendor = "apple")]
 mod durable {
-    use std::{fs::File, os::fd::AsRawFd, path::Path};
+    use std::{fs::File, os::fd::AsRawFd, path::Path, sync::OnceLock};
+
+    pub fn begin(_dir: &Path, _handle: &OnceLock<File>) -> std::io::Result<()> {
+        Ok(())
+    }
 
     /// Plain `fsync` hands the data to the drive without flushing its cache, which `sync_all`
     /// would do per chunk.
@@ -244,20 +283,24 @@ mod durable {
     }
 
     /// F_FULLFSYNC flushes the drive's cache, which holds every chunk `chunk` handed it.
-    pub fn all(dir: &Path) -> std::io::Result<()> {
+    pub fn all(dir: &Path, _handle: &OnceLock<File>) -> std::io::Result<()> {
         File::open(dir)?.sync_all()
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 mod durable {
-    use std::{fs::File, path::Path};
+    use std::{fs::File, path::Path, sync::OnceLock};
+
+    pub fn begin(_dir: &Path, _handle: &OnceLock<File>) -> std::io::Result<()> {
+        Ok(())
+    }
 
     pub fn chunk(file: &File) -> std::io::Result<()> {
         file.sync_all()
     }
 
-    pub fn all(_dir: &Path) -> std::io::Result<()> {
+    pub fn all(_dir: &Path, _handle: &OnceLock<File>) -> std::io::Result<()> {
         Ok(())
     }
 }
