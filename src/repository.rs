@@ -553,7 +553,6 @@ impl Repository {
             )
             .and_then(|mut archive| {
                 // Before the index counts the new chunks, so a crash can't leave it trusting one.
-                // Even if this backup wrote none: a failed one may have left some unsynced.
                 self.storage.sync()?;
                 index.save(&self.index_path())?;
                 archive.write_end_header()?;
@@ -1569,7 +1568,7 @@ impl Job<'_> {
             // The saved index already trusts a rewritten lost chunk, so it is synced at once: the
             // backup may fail or crash before its own sync and leave it torn.
             if !new && !self.new.contains(&hash) {
-                self.storage.sync()?;
+                self.storage.sync_chunk(&hash)?;
             }
             Ok(())
         };
