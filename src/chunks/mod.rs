@@ -104,7 +104,28 @@ pub struct ChunkIndex {
     pub chunk_size: usize,
     pub max_chunk_count: usize,
     pub hash_algorithm: HashAlgorithm,
-    chunks: DashMap<ChunkHash, u64, BuildHasherDefault<PrefixHasher>>,
+    chunks: DashMap<ChunkHash, Count, BuildHasherDefault<PrefixHasher>>,
+}
+
+/// A reference count in the low 63 bits, with the top bit marking a chunk that `reference` took
+/// from zero: one the loaded index did not count.
+#[derive(Clone, Copy, Default)]
+struct Count(u64);
+
+impl Count {
+    const NEW: u64 = 1 << 63;
+
+    fn of(references: u64) -> Self {
+        Self(references & !Self::NEW)
+    }
+
+    fn get(self) -> u64 {
+        self.0 & !Self::NEW
+    }
+
+    fn is_new(self) -> bool {
+        self.0 & Self::NEW != 0
+    }
 }
 
 /// Chunk hashes are already uniform, so the index keys its map by their leading bytes instead of
@@ -192,7 +213,7 @@ impl ChunkIndex {
                     hex(&hash)
                 )));
             }
-            index.chunks.insert(hash, references);
+            index.chunks.insert(hash, Count::of(references));
         }
         if reader.read(&mut [0])? != 0 {
             return Err(invalid("index has trailing data"));
@@ -221,7 +242,7 @@ impl ChunkIndex {
             }
             let id = varint::decode(&mut reader)?;
             let references = varint::decode(&mut reader)?;
-            index.chunks.insert(hash, references);
+            index.chunks.insert(hash, Count::of(references));
             ids.insert(id, hash);
         }
         // The stream can end cleanly before the promised record count.
@@ -274,7 +295,7 @@ impl ChunkIndex {
             if damaged(varint::decode(&mut reader).map(|v| references = v))? {
                 break;
             }
-            index.chunks.insert(hash, references);
+            index.chunks.insert(hash, Count::of(references));
             ids.insert(id, hash);
         }
 
@@ -358,7 +379,7 @@ impl ChunkIndex {
         writer.write_all(&(self.chunks.len() as u64).to_le_bytes())?;
         for entry in self.chunks.iter() {
             writer.write_all(entry.key())?;
-            varint::encode(&mut writer, *entry.value())?;
+            varint::encode(&mut writer, entry.value().get())?;
         }
         let Hashing { mut inner, hasher } = writer;
         inner.write_all(hasher.finalize().as_bytes())?;
@@ -381,13 +402,13 @@ impl ChunkIndex {
     ) -> std::io::Result<Self> {
         let index = Self::new(chunk_size, max_chunk_count, hash_algorithm);
         for hash in storage.list_chunk_hashes()? {
-            index.chunks.insert(hash, 0);
+            index.chunks.insert(hash, Count::default());
         }
         for archive in archives {
             index.count_references(archive?.into_entries())?;
         }
         for entry in index.chunks.iter() {
-            progress(entry.key(), *entry.value());
+            progress(entry.key(), entry.value().get());
         }
         Ok(index)
     }
@@ -421,27 +442,35 @@ impl ChunkIndex {
 
     #[inline]
     pub fn references(&self, hash: &ChunkHash) -> u64 {
-        self.chunks.get(hash).map_or(0, |count| *count)
+        self.chunks.get(hash).map_or(0, |count| count.get())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (ChunkHash, u64)> + '_ {
         self.chunks
             .iter()
-            .map(|entry| (*entry.key(), *entry.value()))
+            .map(|entry| (*entry.key(), entry.value().get()))
     }
 
     /// Increments the reference count and returns it; 1 means the chunk is new.
     pub fn reference(&self, hash: &ChunkHash) -> u64 {
-        let mut count = self.chunks.entry(*hash).or_insert(0);
-        *count = count.saturating_add(1).min(MAX_REFERENCES);
-        *count
+        self.reference_new(hash).0
+    }
+
+    /// `reference`, plus whether the loaded index did not count the chunk. A backup's first
+    /// reference to such a chunk writes it, so later ones neither write it nor look for it.
+    pub(crate) fn reference_new(&self, hash: &ChunkHash) -> (u64, bool) {
+        let mut count = self.chunks.entry(*hash).or_default();
+        let references = (count.get() + 1).min(MAX_REFERENCES);
+        let new = references == 1 || count.is_new();
+        *count = Count(references | if new { Count::NEW } else { 0 });
+        (references, new)
     }
 
     /// Decrements the reference count and returns the new count.
     pub fn dereference(&self, hash: &ChunkHash) -> u64 {
         self.chunks.get_mut(hash).map_or(0, |mut count| {
-            *count = count.saturating_sub(1);
-            *count
+            *count = Count(count.0 - count.get().min(1));
+            count.get()
         })
     }
 
@@ -450,13 +479,13 @@ impl ChunkIndex {
     }
 
     pub fn set(&self, hash: &ChunkHash, count: u64) {
-        self.chunks.insert(*hash, count);
+        self.chunks.insert(*hash, Count::of(count));
     }
 
     pub fn unreferenced(&self) -> Vec<ChunkHash> {
         self.chunks
             .iter()
-            .filter(|entry| *entry.value() == 0)
+            .filter(|entry| entry.value().get() == 0)
             .map(|entry| *entry.key())
             .collect()
     }

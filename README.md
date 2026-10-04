@@ -6,4 +6,4 @@ repositories written before 0.11 use archive format version 1 and are migrated t
 
 0.11 changes the C API (callbacks and the functions taking them gained a `user_data` argument, and the restore functions gained a `restored_callback`), so C programs built against 0.10 must be rebuilt, not just pointed at the new library.
 
-0.12 builds a `ChunkStorageLocal` with `ChunkStorageLocal::new(path)` and requires custom `ChunkStorage` implementations to implement `sync`: `ChunkStorageLocal` no longer flushes each chunk as it writes it, so a wrapper around it has to forward `sync`, and a storage whose writes are already durable can return `Ok(())`.
+0.12 builds a `ChunkStorageLocal` with `ChunkStorageLocal::new(path)` and requires custom `ChunkStorage` implementations to implement `sync`: `ChunkStorageLocal` no longer flushes each chunk as it writes it, so a wrapper around it has to forward `sync`, and a storage whose writes are already durable can return `Ok(())`. a wrapper should forward `sync_chunk` too, whose default syncs everything.

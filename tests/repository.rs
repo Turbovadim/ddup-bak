@@ -1879,6 +1879,7 @@ fn truncated_index_is_rejected() {
 
 struct CountingSync {
     inner: ChunkStorageLocal,
+    writes: Arc<AtomicUsize>,
     syncs: Arc<AtomicUsize>,
 }
 
@@ -1895,6 +1896,7 @@ impl ChunkStorage for CountingSync {
         chunk: &ddup_bak::chunks::ChunkHash,
         content: &[u8],
     ) -> std::io::Result<()> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
         self.inner.write_chunk_content(chunk, content)
     }
 
@@ -1914,10 +1916,11 @@ impl ChunkStorage for CountingSync {
 
 #[test]
 fn a_rewritten_lost_chunk_is_synced_without_waiting_for_the_backup_to_finish() {
-    let syncs = Arc::new(AtomicUsize::new(0));
+    let (writes, syncs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let fixture = Fixture::with_storage(|chunks| {
         Some(Arc::new(CountingSync {
             inner: ChunkStorageLocal::new(chunks),
+            writes: writes.clone(),
             syncs: syncs.clone(),
         }))
     });
@@ -1931,6 +1934,7 @@ fn a_rewritten_lost_chunk_is_synced_without_waiting_for_the_backup_to_finish() {
     let source = fixture.source("src", &files);
 
     fixture.backup("a", &source).unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
     assert_eq!(syncs.swap(0, Ordering::SeqCst), 1);
 
     fs::remove_file(fixture.chunk_path(&content)).unwrap();

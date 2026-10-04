@@ -11,7 +11,6 @@ use crate::{
     },
     lock::Lock,
 };
-use dashmap::DashSet;
 use parking_lot::{Condvar, Mutex};
 use rayon::prelude::*;
 use std::{
@@ -593,7 +592,6 @@ impl Repository {
             max_chunk_count: self.max_chunk_count,
             files: Inflight::new(pool.current_num_threads() * 4),
             chunks: Inflight::new(pool.current_num_threads() * 2),
-            new: DashSet::new(),
             error: Mutex::new(None),
             children: Mutex::new(HashMap::new()),
         };
@@ -1445,8 +1443,6 @@ struct Job<'a> {
     max_chunk_count: usize,
     files: Inflight,
     chunks: Inflight,
-    /// Chunks this backup added to the index.
-    new: DashSet<ChunkHash>,
     error: Mutex<Option<std::io::Error>>,
     children: Mutex<HashMap<PathBuf, Vec<Entry>>>,
 }
@@ -1557,17 +1553,16 @@ impl Job<'_> {
         let store = move || {
             let hash = self.index.hash_algorithm.hash(&data);
             hashes.lock()[slot] = hash;
-            let new = self.index.reference(&hash) == 1;
-            if new {
-                self.new.insert(hash);
-            // A count doesn't prove the chunk exists; a lost one is rewritten here.
-            } else if self.storage.has_chunk(&hash)? {
+            let (references, new) = self.index.reference_new(&hash);
+            // A new chunk is written by its first reference. A count in the saved index doesn't
+            // prove the chunk exists; a lost one is rewritten here.
+            if references > 1 && (new || self.storage.has_chunk(&hash)?) {
                 return Ok(());
             }
             chunks::write_chunk(&**self.storage, &hash, &data, compression)?;
             // The saved index already trusts a rewritten lost chunk, so it is synced at once: the
             // backup may fail or crash before its own sync and leave it torn.
-            if !new && !self.new.contains(&hash) {
+            if !new {
                 self.storage.sync_chunk(&hash)?;
             }
             Ok(())
